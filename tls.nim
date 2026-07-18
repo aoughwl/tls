@@ -25,9 +25,13 @@ type
 
   TlsContext* = object
     ## A long-lived TLS configuration (wraps `SSL_CTX`). Reuse across many
-    ## connections. `handle` is nil when construction failed.
+    ## connections. `handle` is nil when construction failed. `stateId` is a
+    ## 1-based index into the per-context server-side state registry (SNI certs
+    ## + ALPN); 0 means "no state allocated yet" (the default), so raw
+    ## `TlsContext(...)` construction stays valid.
     handle*: nil pointer
     mode*: TlsMode
+    stateId*: int
 
   TlsSocket* = object
     ## One TLS connection over a `Socket` (wraps `SSL`). `ssl` is nil when
@@ -35,6 +39,13 @@ type
     socket*: Socket
     ssl*: nil pointer
     handshakeDone*: bool
+
+  TlsSession* = object
+    ## A captured, resumable TLS session (wraps a refcounted `SSL_SESSION`).
+    ## Obtain one with `getSession` after a handshake, stash it, and pass it to
+    ## a later `wrapClient` / `connectTls` to attempt TLS 1.3 resumption. Free it
+    ## with `freeSession` when done. `handle` is nil when invalid.
+    handle*: nil pointer
 
   TlsStatus* = enum
     tlsOk,          ## operation completed
@@ -113,6 +124,39 @@ proc SSL_get0_alpn_selected(ssl: nil pointer; data: ptr pointer; len: ptr cuint)
 proc ERR_get_error(): culong {.cdecl, importc: "ERR_get_error", dynlib: cryptoLib.}
 proc ERR_error_string_n(e: culong; buf: pointer; len: csize_t) {.cdecl, importc: "ERR_error_string_n", dynlib: cryptoLib.}
 proc ERR_clear_error() {.cdecl, importc: "ERR_clear_error", dynlib: cryptoLib.}
+
+# --- Session resumption + SNI virtual hosting + peer cert inspection ---------
+const
+  # SSL_CTX_ctrl / SSL_CTX_callback_ctrl command numbers (openssl/tls1.h).
+  SSL_CTRL_SET_TLSEXT_SERVERNAME_CB = cint(53)
+  SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG = cint(54)
+  # openssl/ssl.h.
+  SSL_CTRL_SET_SESS_CACHE_MODE = cint(44)
+  TLSEXT_NAMETYPE_host_name_int = cint(0)
+  # SSL_TLSEXT_ERR_* (openssl/tls1.h).
+  SSL_TLSEXT_ERR_OK = cint(0)
+  # Session cache modes (openssl/ssl.h).
+  SSL_SESS_CACHE_OFF* = 0x0000
+  SSL_SESS_CACHE_CLIENT* = 0x0001
+  SSL_SESS_CACHE_SERVER* = 0x0002
+  SSL_SESS_CACHE_BOTH* = 0x0003
+  # NID for the certificate CommonName field (openssl/obj_mac.h).
+  NID_commonName = cint(13)
+
+# Session resumption.
+proc SSL_get1_session(ssl: nil pointer): pointer {.cdecl, importc: "SSL_get1_session", dynlib: sslLib.}
+proc SSL_set_session(ssl: nil pointer; session: nil pointer): cint {.cdecl, importc: "SSL_set_session", dynlib: sslLib.}
+proc SSL_SESSION_free(session: nil pointer) {.cdecl, importc: "SSL_SESSION_free", dynlib: sslLib.}
+proc SSL_session_reused(ssl: nil pointer): cint {.cdecl, importc: "SSL_session_reused", dynlib: sslLib.}
+# SNI virtual hosting.
+proc SSL_CTX_callback_ctrl(ctx: nil pointer; cmd: cint; fp: pointer): clong {.cdecl, importc: "SSL_CTX_callback_ctrl", dynlib: sslLib.}
+proc SSL_set_SSL_CTX(ssl: nil pointer; ctx: nil pointer): pointer {.cdecl, importc: "SSL_set_SSL_CTX", dynlib: sslLib.}
+proc SSL_get_servername(ssl: nil pointer; typ: cint): cstring {.cdecl, importc: "SSL_get_servername", dynlib: sslLib.}
+# Peer certificate inspection.
+proc SSL_get1_peer_certificate(ssl: nil pointer): pointer {.cdecl, importc: "SSL_get1_peer_certificate", dynlib: sslLib.}
+proc X509_free(x: nil pointer) {.cdecl, importc: "X509_free", dynlib: cryptoLib.}
+proc X509_get_subject_name(x: nil pointer): pointer {.cdecl, importc: "X509_get_subject_name", dynlib: cryptoLib.}
+proc X509_NAME_get_text_by_NID(name: nil pointer; nid: cint; buf: pointer; len: cint): cint {.cdecl, importc: "X509_NAME_get_text_by_NID", dynlib: cryptoLib.}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -274,36 +318,133 @@ proc setAlpnProtocols*(ctx: TlsContext; protocols: seq[string]): bool =
   # length prefixes are 1..255 and protocol names are ASCII).
   SSL_CTX_set_alpn_protos(ctx.handle, cast[pointer](toCString(wire)), cuint(wire.len)) == cint(0)
 
-# Server-side ALPN selection. The server negotiates by registering a callback
-# that picks, from the client's offered list, the first protocol the server
-# prefers. The server's preference list is a process-global wire string (one
-# server config per process is the expected use).
-var gServerAlpnWire = ""
+# Server-side per-context state: SNI virtual-host cert selection + ALPN.
+#
+# Two servers in one process must not clobber each other, so the server-side
+# wire state lives in a registry indexed per `TlsContext` rather than in a
+# single process-global. Each server `TlsContext` that gains SNI certs or an
+# ALPN preference is assigned a `stateId` (1-based; 0 = unassigned). The C
+# callbacks receive that id as their `arg` and look their state up in the
+# registry, so no two contexts share mutable wire state. `gServerAlpnWire`
+# remains only as a legacy fallback when a callback carries no valid id.
+type
+  SniEntry = object
+    host: string
+    ctx: nil pointer        ## a child SSL_CTX holding this host's cert + key
+
+  ServerState = object
+    alpnWire: string        ## server ALPN preference, wire format ("" = none)
+    entries: seq[SniEntry]  ## per-SNI-hostname child contexts
+
+var gServerStates: seq[ServerState] = @[]
+var gServerAlpnWire = ""    # legacy fallback (arg-less callbacks)
+
+proc argToStateIndex(arg: pointer): int =
+  ## Decode a callback `arg` (a 1-based stateId) into a 0-based registry index,
+  ## or -1 when there is no valid state.
+  let raw = cast[int](arg)
+  if raw <= 0 or raw > gServerStates.len: return -1
+  raw - 1
 
 proc alpnSelectCb(ssl: nil pointer; outp: ptr pointer; outl: ptr uint8;
                   inp: pointer; inl: cuint; arg: pointer): cint {.cdecl.} =
-  if gServerAlpnWire.len == 0:
+  let idx = argToStateIndex(arg)
+  var wire = gServerAlpnWire
+  if idx >= 0 and gServerStates[idx].alpnWire.len > 0:
+    wire = gServerStates[idx].alpnWire
+  if wire.len == 0:
     return cint(3)   # SSL_TLSEXT_ERR_NOACK
   let rc = SSL_select_next_proto(outp, outl,
-                                 cast[pointer](toCString(gServerAlpnWire)),
-                                 cuint(gServerAlpnWire.len), inp, inl)
+                                 cast[pointer](toCString(wire)),
+                                 cuint(wire.len), inp, inl)
   if rc == cint(1):  # OPENSSL_NPN_NEGOTIATED
     return cint(0)   # SSL_TLSEXT_ERR_OK
   cint(3)            # SSL_TLSEXT_ERR_NOACK
 
-proc setAlpnServer*(ctx: TlsContext; protocols: seq[string]): bool =
+proc sniServernameCb(ssl: nil pointer; al: ptr cint; arg: pointer): cint {.cdecl.} =
+  ## At handshake time pick the child SSL_CTX whose hostname matches the
+  ## client's SNI, so the matching certificate is presented. No match keeps the
+  ## context's default certificate.
+  let idx = argToStateIndex(arg)
+  if idx < 0: return SSL_TLSEXT_ERR_OK
+  let cs = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name_int)
+  if cast[pointer](cs) == nil: return SSL_TLSEXT_ERR_OK
+  let name = cstrToString(cs)
+  var i = 0
+  while i < gServerStates[idx].entries.len:
+    if gServerStates[idx].entries[i].host == name:
+      discard SSL_set_SSL_CTX(ssl, gServerStates[idx].entries[i].ctx)
+      return SSL_TLSEXT_ERR_OK
+    inc i
+  SSL_TLSEXT_ERR_OK
+
+proc ensureServerState(ctx: var TlsContext): int =
+  ## Return the 0-based registry index for `ctx`, allocating (and wiring up the
+  ## SNI servername callback on the underlying SSL_CTX) on first use.
+  if ctx.stateId > 0 and ctx.stateId <= gServerStates.len:
+    return ctx.stateId - 1
+  gServerStates.add ServerState(alpnWire: "", entries: newSeq[SniEntry](0))
+  ctx.stateId = gServerStates.len          # 1-based
+  discard SSL_CTX_callback_ctrl(ctx.handle, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB,
+                                sniServernameCb)
+  discard SSL_CTX_ctrl(ctx.handle, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG,
+                       clong(0), cast[pointer](ctx.stateId))
+  ctx.stateId - 1
+
+proc setAlpnServer*(ctx: var TlsContext; protocols: seq[string]): bool =
   ## (Server) Negotiate ALPN by selecting the server's most-preferred protocol
   ## from the client's offer, e.g. `@["h2", "http/1.1"]`. Unlike
   ## `setAlpnProtocols` (which only advertises, for clients), this registers the
   ## server selection callback so `negotiatedAlpn` reflects the chosen protocol.
+  ## The preference is stored per-context, so multiple servers in one process
+  ## don't clobber each other.
   if not ctx.isValid: return false
-  gServerAlpnWire = alpnWire(protocols)
-  if gServerAlpnWire.len == 0: return false
-  SSL_CTX_set_alpn_select_cb(ctx.handle, alpnSelectCb, nil)
+  let wire = alpnWire(protocols)
+  if wire.len == 0: return false
+  let idx = ensureServerState(ctx)
+  gServerStates[idx].alpnWire = wire
+  gServerAlpnWire = wire     # keep legacy fallback in sync for single-server use
+  SSL_CTX_set_alpn_select_cb(ctx.handle, alpnSelectCb, cast[pointer](ctx.stateId))
+  true
+
+proc addCertificate*(ctx: var TlsContext; hostname: string;
+                     certChainFile: string; keyFile: string): bool =
+  ## (Server) Register an additional certificate + key to serve when a client's
+  ## SNI hostname matches `hostname` (TLS virtual hosting). The certificate
+  ## given to `newTlsServerContext` remains the default fallback for connections
+  ## whose SNI matches nothing here (or omit SNI). Returns false if the context
+  ## isn't a valid server context or the cert/key fails to load or mismatch.
+  if not ctx.isValid or ctx.mode != tlsServer: return false
+  let child = SSL_CTX_new(TLS_server_method())
+  if child == nil: return false
+  var cf = certChainFile
+  var kf = keyFile
+  if SSL_CTX_use_certificate_chain_file(child, toCString(cf)) != cint(1):
+    SSL_CTX_free(child)
+    return false
+  if SSL_CTX_use_PrivateKey_file(child, toCString(kf), SSL_FILETYPE_PEM) != cint(1):
+    SSL_CTX_free(child)
+    return false
+  if SSL_CTX_check_private_key(child) != cint(1):
+    SSL_CTX_free(child)
+    return false
+  let idx = ensureServerState(ctx)
+  gServerStates[idx].entries.add SniEntry(host: hostname, ctx: child)
   true
 
 proc close*(ctx: var TlsContext) =
-  ## Free the underlying `SSL_CTX`.
+  ## Free the underlying `SSL_CTX` and any per-SNI child contexts.
+  if ctx.stateId > 0 and ctx.stateId <= gServerStates.len:
+    let idx = ctx.stateId - 1
+    var i = 0
+    while i < gServerStates[idx].entries.len:
+      if gServerStates[idx].entries[i].ctx != nil:
+        SSL_CTX_free(gServerStates[idx].entries[i].ctx)
+        gServerStates[idx].entries[i].ctx = nil
+      inc i
+    gServerStates[idx].entries = newSeq[SniEntry](0)
+    gServerStates[idx].alpnWire = ""
+    ctx.stateId = 0
   if ctx.handle != nil:
     SSL_CTX_free(ctx.handle)
     ctx.handle = nil
@@ -333,11 +474,16 @@ proc handshake*(t: var TlsSocket): TlsStatus =
   if result == tlsOk:
     t.handshakeDone = true
 
-proc wrapClient*(ctx: TlsContext; socket: Socket; serverName: string): TlsSocket =
+proc wrapClient*(ctx: TlsContext; socket: Socket; serverName: string;
+                 session = TlsSession(handle: nil)): TlsSocket =
   ## Begin a client TLS session over an already-connected `socket`. Sets SNI and
   ## the verification hostname to `serverName`, then runs the handshake (blocking
   ## sockets complete here; use `handshake` to resume a non-blocking one). Check
   ## `handshakeDone` / `isValid` on the result.
+  ##
+  ## Pass a `session` captured from an earlier connection (via `getSession`) to
+  ## attempt TLS 1.3 resumption; check `sessionReused` on the result once the
+  ## handshake completes.
   result = TlsSocket(socket: socket, ssl: nil, handshakeDone: false)
   if not ctx.isValid or not socket.isValid: return result
   let ssl = SSL_new(ctx.handle)
@@ -346,6 +492,9 @@ proc wrapClient*(ctx: TlsContext; socket: Socket; serverName: string): TlsSocket
     SSL_free(ssl)
     return result
   SSL_set_connect_state(ssl)
+  # Offer a prior session for resumption (before the handshake starts).
+  if session.handle != nil:
+    discard SSL_set_session(ssl, session.handle)
   # SNI + hostname verification.
   var host = serverName
   if host.len > 0:
@@ -355,19 +504,21 @@ proc wrapClient*(ctx: TlsContext; socket: Socket; serverName: string): TlsSocket
   result.ssl = ssl
   discard handshake(result)
 
-proc connectTls*(ctx: TlsContext; host: string; port: int): TlsSocket =
+proc connectTls*(ctx: TlsContext; host: string; port: int;
+                 session = TlsSession(handle: nil)): TlsSocket =
   ## Ergonomic client entry: resolve `host`, open a TCP connection, and run the
   ## client TLS handshake with SNI + hostname verification set to `host`.
   ## Blocking; check `handshakeDone` / `isValid` on the result. The returned
   ## socket keeps `ctx` alive via OpenSSL's refcount, so `ctx` may be closed
-  ## afterwards without tearing down live connections.
+  ## afterwards without tearing down live connections. Pass a `session` to
+  ## attempt resumption (see `getSession` / `sessionReused`).
   result = TlsSocket(socket: invalidSocket(), ssl: nil, handshakeDone: false)
   if not ctx.isValid: return result
   var raw = 0'u32
   if not resolveTcp4(host, raw): return result
   let sock = Socket(handle: connectTcp4(raw, port))
   if not sock.isValid: return result
-  result = wrapClient(ctx, sock, host)
+  result = wrapClient(ctx, sock, host, session)
 
 proc wrapServer*(ctx: TlsContext; socket: Socket): TlsSocket =
   ## Begin a server TLS session over an accepted `socket` and run the handshake.
@@ -523,6 +674,69 @@ proc verifyResultCode*(t: TlsSocket): int =
   ## The raw X509 verification result code (0 == X509_V_OK).
   if not t.isValid: return -1
   int(SSL_get_verify_result(t.ssl))
+
+proc peerCertCommonName*(t: TlsSocket): string =
+  ## The CommonName (CN) of the peer's leaf certificate subject, or "" if there
+  ## is no peer certificate / no CN. Handy on a client to confirm which cert a
+  ## multi-cert (SNI) server selected.
+  result = ""
+  if not t.isValid: return result
+  let cert = SSL_get1_peer_certificate(t.ssl)
+  if cert == nil: return result
+  let name = X509_get_subject_name(cert)
+  if name == nil:
+    X509_free(cert)
+    return result
+  var buf = default(array[256, char])
+  let n = X509_NAME_get_text_by_NID(name, NID_commonName, addr buf[0], cint(buf.len))
+  if n > cint(0):
+    var i = 0
+    while i < int(n) and i < buf.len and buf[i] != '\0':
+      result.add buf[i]
+      inc i
+  X509_free(cert)
+
+# ---------------------------------------------------------------------------
+# Session resumption
+# ---------------------------------------------------------------------------
+
+proc setSessionCacheMode*(ctx: TlsContext; mode: int): bool =
+  ## Set the SSL_CTX session-cache mode (one of `SSL_SESS_CACHE_*`). On a client
+  ## context, `SSL_SESS_CACHE_CLIENT` keeps captured sessions available for
+  ## reuse; on a server, `SSL_SESS_CACHE_SERVER` (the default) enables the
+  ## internal cache. Returns false only if the context is invalid.
+  if not ctx.isValid: return false
+  discard SSL_CTX_ctrl(ctx.handle, SSL_CTRL_SET_SESS_CACHE_MODE, clong(mode), nil)
+  true
+
+proc enableClientSessionCache*(ctx: TlsContext): bool =
+  ## Convenience: turn on client-side session caching so `getSession` reliably
+  ## captures a resumable TLS 1.3 session (including its ticket).
+  setSessionCacheMode(ctx, SSL_SESS_CACHE_CLIENT)
+
+proc getSession*(t: TlsSocket): TlsSession =
+  ## Capture the current session as a resumable handle (refcounted; free it with
+  ## `freeSession`). Call after the handshake completed and — for TLS 1.3 — after
+  ## at least one `recv`, so the server's session ticket has been processed.
+  ## The returned session is invalid (`isValid` false) if none is available.
+  result = TlsSession(handle: nil)
+  if not t.isValid or not t.handshakeDone: return result
+  result = TlsSession(handle: SSL_get1_session(t.ssl))
+
+proc isValid*(s: TlsSession): bool =
+  s.handle != nil
+
+proc freeSession*(s: var TlsSession) =
+  ## Release a captured session.
+  if s.handle != nil:
+    SSL_SESSION_free(s.handle)
+    s.handle = nil
+
+proc sessionReused*(t: TlsSocket): bool =
+  ## True when the just-completed handshake resumed a prior session (a session
+  ## supplied via `wrapClient` / `connectTls` was accepted by the peer).
+  if not t.isValid: return false
+  SSL_session_reused(t.ssl) == cint(1)
 
 # ---------------------------------------------------------------------------
 # Teardown

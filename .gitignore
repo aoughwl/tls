@@ -1,2 +1,8 @@
 nimcache/
 tests/nimcache/
+vendor/src/
+vendor/bin/
+vendor/lib/
+vendor/include/
+vendor/ssl/
+vendor/share/

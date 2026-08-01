@@ -73,6 +73,9 @@ const
   SSL_CTRL_SET_TLSEXT_HOSTNAME = cint(55)
   SSL_CTRL_SET_MIN_PROTO_VERSION = cint(123)
   SSL_CTRL_SET_MAX_PROTO_VERSION = cint(124)
+  SSL_CTRL_SET_GROUPS_LIST = cint(92)
+  SSL_CTRL_SET_SIGALGS_LIST = cint(98)
+  SSL_CTRL_GET_NEGOTIATED_GROUP = cint(134)
   TLSEXT_NAMETYPE_host_name = clong(0)
   # X509_V_OK.
   X509_V_OK = clong(0)
@@ -99,6 +102,7 @@ proc SSL_CTX_set_alpn_protos(ctx: nil pointer; protos: pointer; len: cuint): cin
 proc SSL_CTX_set_alpn_select_cb(ctx: nil pointer; cb: pointer; arg: nil pointer) {.cdecl, importc: "SSL_CTX_set_alpn_select_cb", dynlib: sslLib.}
 proc SSL_select_next_proto(outp: ptr pointer; outl: ptr uint8; server: pointer; slen: cuint; client: pointer; clen: cuint): cint {.cdecl, importc: "SSL_select_next_proto", dynlib: sslLib.}
 proc SSL_CTX_ctrl(ctx: nil pointer; cmd: cint; larg: clong; parg: nil pointer): clong {.cdecl, importc: "SSL_CTX_ctrl", dynlib: sslLib.}
+proc OBJ_nid2sn(n: cint): nil pointer {.cdecl, importc: "OBJ_nid2sn", dynlib: cryptoLib.}
 
 proc SSL_new(ctx: nil pointer): pointer {.cdecl, importc: "SSL_new", dynlib: sslLib.}
 proc SSL_free(ssl: nil pointer) {.cdecl, importc: "SSL_free", dynlib: sslLib.}
@@ -292,6 +296,31 @@ proc setMaxVersion*(ctx: TlsContext; version: int): bool =
   ## Cap the negotiated protocol version.
   if not ctx.isValid: return false
   SSL_CTX_ctrl(ctx.handle, SSL_CTRL_SET_MAX_PROTO_VERSION, clong(version), nil) == clong(1)
+
+const
+  PostQuantumGroups* = "X25519MLKEM768:X25519:P-256:P-384"
+    ## A sensible post-quantum-hybrid preference: ML-KEM-768 combined with
+    ## X25519 first, classical curves behind it. Requires OpenSSL >= 3.5 (the
+    ## system 3.0.x here does not know ML-KEM); see vendor/build-openssl.sh.
+
+proc setGroups*(ctx: TlsContext; groups: string): bool =
+  ## Set the key-exchange groups to offer, most preferred first, as a
+  ## colon-separated list (e.g. `PostQuantumGroups`). This is how post-quantum
+  ## key exchange is turned on: with OpenSSL 3.5+ the name `X25519MLKEM768`
+  ## resolves to the ML-KEM hybrid, and a peer that does not know it simply
+  ## negotiates the next group in the list.
+  if not ctx.isValid: return false
+  var g = groups
+  SSL_CTX_ctrl(ctx.handle, SSL_CTRL_SET_GROUPS_LIST, clong(0),
+               cast[pointer](toCString(g))) == clong(1)
+
+proc setSigAlgs*(ctx: TlsContext; algs: string): bool =
+  ## Set the signature algorithms to advertise, most preferred first
+  ## (e.g. "ECDSA+SHA256:RSA-PSS+SHA256").
+  if not ctx.isValid: return false
+  var a = algs
+  SSL_CTX_ctrl(ctx.handle, SSL_CTRL_SET_SIGALGS_LIST, clong(0),
+               cast[pointer](toCString(a))) == clong(1)
 
 proc alpnWire(protocols: seq[string]): string =
   ## Build the ALPN wire format: each protocol as a 1-byte length prefix + name.
@@ -661,6 +690,61 @@ proc negotiatedAlpn*(t: TlsSocket): string =
   result = ""
   var i = 0
   while i < int(length):
+    result.add bytes[i]
+    inc i
+
+proc negotiatedGroupId*(t: TlsSocket): int =
+  ## The NID of the key-exchange group the handshake actually settled on, or 0.
+  if not t.isValid: return 0
+  int(SSL_ctrl(t.ssl, SSL_CTRL_GET_NEGOTIATED_GROUP, clong(0), cast[pointer](0)))
+
+const
+  TlsextNidUnknown = 0x1000000
+    ## OpenSSL ORs this into the "negotiated group" for any group that has no
+    ## object NID — which is every post-quantum hybrid. The low 16 bits are then
+    ## the raw IANA TLS supported-group codepoint.
+
+proc groupCodepointName(code: int): string =
+  ## Names for the groups OpenSSL cannot name itself (RFC 8446 registry).
+  case code
+  of 0x11EB: "SecP256r1MLKEM768"
+  of 0x11EC: "X25519MLKEM768"
+  of 0x11ED: "SecP384r1MLKEM1024"
+  of 0x0200: "MLKEM512"
+  of 0x0201: "MLKEM768"
+  of 0x0202: "MLKEM1024"
+  else: ""
+
+proc toHex4(v: int): string =
+  const digits = "0123456789abcdef"
+  result = "0x"
+  var shift = 12
+  while shift >= 0:
+    result.add digits[(v shr shift) and 0xf]
+    shift = shift - 4
+
+proc negotiatedGroup*(t: TlsSocket): string =
+  ## The key-exchange group actually negotiated, by name (e.g. "X25519MLKEM768"
+  ## or "x25519"). Setting a preference is only half of a knob — this is how a
+  ## caller confirms what the peer agreed to, rather than assuming.
+  ##
+  ## Post-quantum groups have no OpenSSL object NID, so they arrive as
+  ## `TLSEXT_nid_unknown | codepoint` and are decoded from the IANA registry
+  ## here; anything still unrecognised comes back as "group-0xNNNN" rather than
+  ## as an empty string, so a caller is never left guessing.
+  let nid = negotiatedGroupId(t)
+  if nid == 0: return ""
+  if (nid and TlsextNidUnknown) != 0:
+    let code = nid and 0xFFFF
+    let named = groupCodepointName(code)
+    if named.len > 0: return named
+    return "group-" & toHex4(code)
+  let sn = OBJ_nid2sn(cint(nid))
+  if sn == nil: return ""
+  result = ""
+  let bytes = cast[ptr UncheckedArray[char]](sn)
+  var i = 0
+  while i < 128 and bytes[i] != '\0':
     result.add bytes[i]
     inc i
 

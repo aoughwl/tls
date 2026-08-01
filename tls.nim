@@ -14,6 +14,8 @@
 
 import net
 import tcp
+import tlsconfig
+export tlsconfig
 
 const
   sslLib = "libssl.so.3"
@@ -835,3 +837,96 @@ proc closeTls*(t: var TlsSocket; closeSocket = true) =
   t.handshakeDone = false
   if closeSocket:
     t.socket.close()
+
+# ---------------------------------------------------------------------------
+# Policy as data
+#
+# The setters above are the mechanism; `TlsConfig` is the policy. Splitting
+# them is what lets something that does not own the context — a server entry
+# point, a process-wide default, a per-virtual-host override — still say what
+# the TLS should look like.
+# ---------------------------------------------------------------------------
+
+proc note(report: var TlsConfigReport; name: string; succeeded: bool) =
+  if succeeded:
+    report.applied = report.applied + 1
+  else:
+    report.failed = report.failed + 1
+    if report.firstFailure.len == 0:
+      report.firstFailure = name
+
+proc applyTlsConfig*(ctx: var TlsContext; cfg: TlsConfig): TlsConfigReport =
+  ## Apply every set field of `cfg` to an existing context, reporting what
+  ## OpenSSL accepted. Unset fields are not touched, so applying
+  ## `defaultTlsConfig()` is a no-op.
+  ##
+  ## Two fields are deliberately not consumed here, for the same reason
+  ## `TcpOpts.backlog` is not: they are not context settings.
+  ## `certChainFile`/`keyFile` belong to context *construction*, and
+  ## `serverName` is per-connection SNI, chosen at `wrapClient` time.
+  result = TlsConfigReport(applied: 0, failed: 0, firstFailure: "")
+  if not ctx.isValid:
+    note(result, "context", false)
+    return result
+
+  # Trust configuration first: verification mode has to be in place before any
+  # handshake, and loading a CA bundle after switching verification off would
+  # read as an inconsistency in the report.
+  if cfg.useSystemTrust == optOn:
+    note(result, "useSystemTrust", useDefaultVerifyPaths(ctx))
+  if cfg.caFile.len > 0:
+    note(result, "caFile", loadVerifyLocations(ctx, cfg.caFile))
+  if cfg.verifyPeer != optUnset:
+    setVerifyPeer(ctx, cfg.verifyPeer == optOn)
+    note(result, "verifyPeer", true)
+
+  if cfg.minVersion != TlsUnset:
+    note(result, "minVersion", setMinVersion(ctx, cfg.minVersion))
+  if cfg.maxVersion != TlsUnset:
+    note(result, "maxVersion", setMaxVersion(ctx, cfg.maxVersion))
+  if cfg.cipherList.len > 0:
+    note(result, "cipherList", setCipherList(ctx, cfg.cipherList))
+  if cfg.cipherSuites.len > 0:
+    note(result, "cipherSuites", setCipherSuites(ctx, cfg.cipherSuites))
+  if cfg.groups.len > 0:
+    note(result, "groups", setGroups(ctx, cfg.groups))
+  if cfg.sigAlgs.len > 0:
+    note(result, "sigAlgs", setSigAlgs(ctx, cfg.sigAlgs))
+  if cfg.sessionCacheMode != TlsUnset:
+    note(result, "sessionCacheMode", setSessionCacheMode(ctx, cfg.sessionCacheMode))
+
+  # ALPN means two different things by role: a client advertises a list, a
+  # server registers a callback that selects from the client's offer. One
+  # field, because from a caller's point of view it is one decision.
+  if cfg.alpn.len > 0:
+    if ctx.mode == tlsServer:
+      note(result, "alpn", setAlpnServer(ctx, cfg.alpn))
+    else:
+      note(result, "alpn", setAlpnProtocols(ctx, cfg.alpn))
+
+proc newTlsClientContext*(cfg: TlsConfig; report: var TlsConfigReport): TlsContext =
+  ## A client context built from a policy. Note that verification is whatever
+  ## the config says and nothing more: unlike the `verify = true` overload this
+  ## does not quietly load the system trust store on your behalf, which is why
+  ## `defaultClientConfig()` sets both fields explicitly.
+  report = TlsConfigReport(applied: 0, failed: 0, firstFailure: "")
+  let ctx = SSL_CTX_new(TLS_client_method())
+  result = TlsContext(handle: ctx, mode: tlsClient)
+  if ctx == nil:
+    note(report, "SSL_CTX_new", false)
+    return result
+  report = applyTlsConfig(result, cfg)
+
+proc newTlsServerContext*(cfg: TlsConfig; report: var TlsConfigReport): TlsContext =
+  ## A server context built from a policy. The certificate pair comes from the
+  ## config, so a server entry point can be handed one value instead of a cert
+  ## path, a key path, and no way to say anything else.
+  report = TlsConfigReport(applied: 0, failed: 0, firstFailure: "")
+  if not hasCertificate(cfg):
+    note(report, "certificate", false)
+    return TlsContext(handle: nil, mode: tlsServer)
+  result = newTlsServerContext(cfg.certChainFile, cfg.keyFile)
+  if not result.isValid:
+    note(report, "certificate", false)
+    return result
+  report = applyTlsConfig(result, cfg)

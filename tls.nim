@@ -12,14 +12,24 @@
 ## the handshake / read / write surface `tlsWantRead` / `tlsWantWrite` so a
 ## caller can drive it from a poll loop.
 
+import std/[os, envvars]
 import net
 import tcp
 import tlsconfig
 export tlsconfig
 
-const
-  sslLib = "libssl.so.3"
-  cryptoLib = "libcrypto.so.3"
+when defined(windows):
+  const
+    sslLib = "libssl-3-x64.dll"
+    cryptoLib = "libcrypto-3-x64.dll"
+elif defined(macosx):
+  const
+    sslLib = "libssl.3.dylib"
+    cryptoLib = "libcrypto.3.dylib"
+else:
+  const
+    sslLib = "libssl.so.3"
+    cryptoLib = "libcrypto.so.3"
 
 type
   TlsMode* = enum
@@ -219,6 +229,23 @@ proc classify(ssl: nil pointer; ret: cint): TlsStatus =
 # Context construction / configuration
 # ---------------------------------------------------------------------------
 
+proc loadFallbackTrust(ctx: nil pointer) =
+  ## OpenSSL on Windows has no default CA store. Load the first bundle found:
+  ## $SSL_CERT_FILE, then well-known locations (MSYS2, Git for Windows, a
+  ## cacert.pem beside the program). Harmless elsewhere: the system store wins.
+  var candidates: seq[string] = @[]
+  let envFile = getEnv("SSL_CERT_FILE")
+  if envFile.len > 0: candidates.add envFile
+  when defined(windows):
+    candidates.add "C:/msys64/usr/ssl/certs/ca-bundle.crt"
+    candidates.add "C:/msys64/ucrt64/etc/ssl/certs/ca-bundle.crt"
+    candidates.add "C:/Program Files/Git/mingw64/etc/ssl/certs/ca-bundle.crt"
+    candidates.add "C:/Program Files/Git/usr/ssl/certs/ca-bundle.crt"
+    candidates.add getAppFilename().parentDir & "/cacert.pem"
+  for f in candidates:
+    if fileExists(f):
+      if SSL_CTX_load_verify_locations(ctx, f.toCString(), nil) == cint(1): return
+
 proc newTlsClientContext*(verify = true): TlsContext =
   ## A client context. When `verify` is true (default) the server certificate
   ## chain is validated against the system trust store; set false only for
@@ -230,6 +257,7 @@ proc newTlsClientContext*(verify = true): TlsContext =
     return result
   if verify:
     discard SSL_CTX_set_default_verify_paths(ctx)
+    when defined(windows): loadFallbackTrust(ctx)
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
   else:
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nil)

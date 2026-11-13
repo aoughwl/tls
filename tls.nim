@@ -229,10 +229,61 @@ proc classify(ssl: nil pointer; ret: cint): TlsStatus =
 # Context construction / configuration
 # ---------------------------------------------------------------------------
 
+when defined(windows):
+  # The Windows "ROOT" system store, read live through crypt32 and fed into the context's own
+  # X509_STORE (DER -> d2i_X509 -> X509_STORE_add_cert). OpenSSL has no default CA locations on
+  # Windows, so without this every https verify fails unless a bundle file happens to exist.
+  # Ported from the netstack mod's aowltls (loadWindowsRootCerts), which is how the browser
+  # already gets trust; the host's spnet.h does the same through LoadLibrary.
+  type
+    WinCertContext {.bycopy.} = object
+      dwCertEncodingType: uint32
+      pbCertEncoded: ptr byte
+      cbCertEncoded: uint32
+      pCertInfo: pointer
+      hCertStore: pointer
+
+  proc CertOpenSystemStoreA(hProv: nil pointer; szSubsystemProtocol: cstring): nil pointer
+    {.stdcall, importc: "CertOpenSystemStoreA", dynlib: "crypt32.dll".}
+  proc CertEnumCertificatesInStore(hCertStore: nil pointer; pPrevCertContext: nil pointer): nil pointer
+    {.stdcall, importc: "CertEnumCertificatesInStore", dynlib: "crypt32.dll".}
+  proc CertCloseStore(hCertStore: nil pointer; dwFlags: uint32): cint
+    {.stdcall, importc: "CertCloseStore", dynlib: "crypt32.dll".}
+  proc d2i_X509(ppCert: nil pointer; ppin: ptr ptr byte; length: clong): nil pointer
+    {.cdecl, importc: "d2i_X509", dynlib: cryptoLib.}
+  proc SSL_CTX_get_cert_store(ctx: nil pointer): nil pointer
+    {.cdecl, importc: "SSL_CTX_get_cert_store", dynlib: sslLib.}
+  proc X509_STORE_add_cert(store: nil pointer; x: nil pointer): cint
+    {.cdecl, importc: "X509_STORE_add_cert", dynlib: cryptoLib.}
+
+  proc loadWindowsRootCerts(sslCtx: nil pointer): int =
+    ## Copies every cert of the Windows "ROOT" store into `sslCtx`'s verify store. Returns how
+    ## many were added (0 = the store could not be opened; verification then relies on the
+    ## fallback bundle only).
+    result = 0
+    let store = CertOpenSystemStoreA(nil, "ROOT")
+    if store == nil: return result
+    let x509Store = SSL_CTX_get_cert_store(sslCtx)
+    var pCert: nil pointer = nil
+    pCert = CertEnumCertificatesInStore(store, pCert)
+    while pCert != nil:
+      let c = cast[ptr WinCertContext](pCert)
+      var p = c.pbCertEncoded
+      let x509 = d2i_X509(nil, addr p, clong(c.cbCertEncoded))
+      if x509 != nil:
+        if X509_STORE_add_cert(x509Store, x509) == cint(1):
+          inc result
+        X509_free(x509)
+      pCert = CertEnumCertificatesInStore(store, pCert)
+    discard CertCloseStore(store, 0)
+
 proc loadFallbackTrust(ctx: nil pointer) =
-  ## OpenSSL on Windows has no default CA store. Load the first bundle found:
+  ## OpenSSL on Windows has no default CA store. Load the Windows system ROOT store, then the
+  ## first bundle found:
   ## $SSL_CERT_FILE, then well-known locations (MSYS2, Git for Windows, a
   ## cacert.pem beside the program). Harmless elsewhere: the system store wins.
+  when defined(windows):
+    if loadWindowsRootCerts(ctx) > 0: return
   var candidates: seq[string] = @[]
   let envFile = getEnv("SSL_CERT_FILE")
   if envFile.len > 0: candidates.add envFile
